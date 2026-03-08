@@ -4,24 +4,26 @@ import logging
 import requests
 import time
 
-# ── Langsung baca dari os.environ ──────────────
+# ── Baca dari os.environ ────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-GROQ_MODEL     = "llama-3.3-70b-versatile"
+GEMINI_MODEL   = "gemini-2.0-flash"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 log = logging.getLogger(__name__)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+GEMINI_API   = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
 # ── Memory percakapan per user ──────────────────
 memory: dict = {}
 MAX_HISTORY = 10
 
-SYSTEM_PROMPT = """Kamu adalah asisten AI yang cerdas dan ramah.
+SYSTEM_PROMPT = """Kamu adalah asisten AI yang cerdas, ramah, dan helpful.
 Jawab dalam bahasa yang sama dengan user (Indonesia atau Inggris).
-Jika ada hasil pencarian, gunakan untuk menjawab dengan akurat."""
+Jika ada hasil pencarian internet, gunakan untuk menjawab dengan akurat.
+Jika tidak tahu sesuatu, katakan jujur."""
 
 
 # ── Tools ───────────────────────────────────────
@@ -51,16 +53,17 @@ def calculate(expression: str) -> str:
     try:
         allowed = set("0123456789+-*/()., ")
         if all(c in allowed for c in expression):
-            return f"{expression} = {eval(expression)}"  # noqa: S307
+            return f"{expression} = {eval(expression)}"
         return "Ekspresi tidak valid."
     except Exception as e:
         return f"Error: {e}"
 
 
-TOOLS_DEF = [
-    {
-        "type": "function",
-        "function": {
+TOOLS_MAP = {"search_internet": search_internet, "calculate": calculate}
+
+GEMINI_TOOLS = {
+    "function_declarations": [
+        {
             "name": "search_internet",
             "description": "Cari informasi terbaru di internet.",
             "parameters": {
@@ -69,10 +72,7 @@ TOOLS_DEF = [
                 "required": ["query"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
+        {
             "name": "calculate",
             "description": "Hitung ekspresi matematika.",
             "parameters": {
@@ -81,50 +81,58 @@ TOOLS_DEF = [
                 "required": ["expression"],
             },
         },
-    },
-]
-
-TOOLS_MAP = {"search_internet": search_internet, "calculate": calculate}
+    ]
+}
 
 
-# ── Groq LLM ────────────────────────────────────
-
-def call_groq(messages: list) -> dict:
-    r = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json={"model": GROQ_MODEL, "messages": messages, "tools": TOOLS_DEF,
-              "tool_choice": "auto", "max_tokens": 1024},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
+# ── Gemini Agent ─────────────────────────────────
 
 def run_agent(user_id: int, user_msg: str) -> str:
     if user_id not in memory:
         memory[user_id] = []
 
     history = memory[user_id]
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
-        {"role": "user", "content": user_msg}
-    ]
+    contents = []
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+    contents.append({"role": "user", "parts": [{"text": user_msg}]})
 
     for _ in range(5):
-        resp = call_groq(messages)
-        choice = resp["choices"][0]
-        msg = choice["message"]
-        messages.append(msg)
+        payload = {
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": contents,
+            "tools": [GEMINI_TOOLS],
+            "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.7},
+        }
+        r = requests.post(GEMINI_API, json=payload, timeout=30)
+        r.raise_for_status()
+        resp = r.json()
 
-        if choice["finish_reason"] == "tool_calls":
-            for tc in msg.get("tool_calls", []):
-                fn_name = tc["function"]["name"]
-                fn_args = json.loads(tc["function"].get("arguments", "{}"))
-                log.info(f"Tool: {fn_name}({fn_args})")
-                result = TOOLS_MAP[fn_name](**fn_args)
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
+        candidate = resp["candidates"][0]
+        parts = candidate["content"].get("parts", [])
+        has_tool_call = any("functionCall" in p for p in parts)
+
+        if has_tool_call:
+            contents.append({"role": "model", "parts": parts})
+            tool_results = []
+            for part in parts:
+                if "functionCall" in part:
+                    fn_name = part["functionCall"]["name"]
+                    fn_args = part["functionCall"].get("args", {})
+                    log.info(f"Tool: {fn_name}({fn_args})")
+                    result = TOOLS_MAP[fn_name](**fn_args)
+                    tool_results.append({
+                        "functionResponse": {
+                            "name": fn_name,
+                            "response": {"result": result}
+                        }
+                    })
+            contents.append({"role": "user", "parts": tool_results})
         else:
-            answer = msg.get("content", "Maaf, tidak ada jawaban.")
+            answer = "".join(p.get("text", "") for p in parts).strip()
+            if not answer:
+                answer = "Maaf, tidak ada jawaban."
             history.append({"role": "user", "content": user_msg})
             history.append({"role": "assistant", "content": answer})
             if len(history) > MAX_HISTORY * 2:
@@ -134,44 +142,34 @@ def run_agent(user_id: int, user_msg: str) -> str:
     return "Maaf, tidak bisa menyelesaikan permintaan."
 
 
-# ── Telegram API helpers ─────────────────────────
+# ── Telegram helpers ─────────────────────────────
 
 def send_message(chat_id: int, text: str):
-    requests.post(f"{TELEGRAM_API}/sendMessage", json={
-        "chat_id": chat_id, "text": text
-    }, timeout=10)
-
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=10)
 
 def send_typing(chat_id: int):
-    requests.post(f"{TELEGRAM_API}/sendChatAction", json={
-        "chat_id": chat_id, "action": "typing"
-    }, timeout=5)
-
+    requests.post(f"{TELEGRAM_API}/sendChatAction", json={"chat_id": chat_id, "action": "typing"}, timeout=5)
 
 def get_updates(offset: int = 0) -> list:
-    r = requests.get(f"{TELEGRAM_API}/getUpdates", params={
-        "offset": offset, "timeout": 30
-    }, timeout=35)
+    r = requests.get(f"{TELEGRAM_API}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=35)
     return r.json().get("result", [])
 
 
-# ── Handler pesan ────────────────────────────────
+# ── Handler ──────────────────────────────────────
 
 def handle_update(update: dict):
     msg = update.get("message", {})
     if not msg:
         return
-
     chat_id = msg["chat"]["id"]
     user_id = msg["from"]["id"]
     text    = msg.get("text", "")
-
     if not text:
         return
 
     if text == "/start":
         send_message(chat_id,
-            "👋 Halo! Saya AI Agent yang bisa:\n"
+            "👋 Halo! Saya AI Agent powered by Gemini yang bisa:\n"
             "🔍 Cari info di internet\n"
             "🧮 Hitung matematika\n"
             "💬 Ingat percakapan kita\n\n"
@@ -179,19 +177,12 @@ def handle_update(update: dict):
             "/clear - hapus history"
         )
         return
-
     if text == "/clear":
         memory[user_id] = []
         send_message(chat_id, "🗑️ History dihapus!")
         return
-
     if text == "/help":
-        send_message(chat_id,
-            "💡 Contoh:\n"
-            "• Berita AI terbaru?\n"
-            "• Hitung 1234 * 5678\n"
-            "• Jelaskan machine learning\n"
-        )
+        send_message(chat_id, "💡 Contoh:\n• Berita AI terbaru?\n• Hitung 1234 * 5678\n• Jelaskan machine learning")
         return
 
     send_typing(chat_id)
@@ -200,15 +191,14 @@ def handle_update(update: dict):
     except Exception as e:
         log.error(f"Error: {e}")
         reply = f"❌ Error: {e}"
-
     send_message(chat_id, reply)
 
 
-# ── Main loop ────────────────────────────────────
+# ── Main ─────────────────────────────────────────
 
 def main():
-    log.info("✅ ENV OK — Token ada, Groq key ada")
-    log.info("🤖 Bot berjalan dengan long polling...")
+    log.info("✅ ENV OK — Telegram & Gemini key ada")
+    log.info("🤖 Bot berjalan dengan Gemini AI...")
     offset = 0
     while True:
         try:
@@ -219,7 +209,6 @@ def main():
         except Exception as e:
             log.error(f"Error polling: {e}")
             time.sleep(3)
-
 
 if __name__ == "__main__":
     main()

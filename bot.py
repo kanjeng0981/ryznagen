@@ -11,17 +11,17 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from dotenv import load_dotenv
 
-load_dotenv()
+
+
 
 # ──────────────────────────────────────────────
 # KONFIGURASI
 # ──────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL     = "llama3-8b-8192"          # model gratis dari Groq
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # untuk search internet (gratis)
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

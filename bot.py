@@ -8,7 +8,7 @@ import time
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-GROQ_MODEL     = "llama3-8b-8192"
+GROQ_MODEL     = "llama3-groq-8b-8192-tool-use-preview"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 log = logging.getLogger(__name__)

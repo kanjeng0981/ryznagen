@@ -2,113 +2,70 @@ import os
 import json
 import logging
 import requests
-from datetime import datetime
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+import time
 
-
-
-
-# ──────────────────────────────────────────────
-# KONFIGURASI
-# ──────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL     = "llama3-8b-8192"          # model gratis dari Groq
+# ── Langsung baca dari os.environ ──────────────
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+GROQ_MODEL     = "llama3-8b-8192"
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# MEMORY: simpan history per user (in-memory)
-# ──────────────────────────────────────────────
-# Format: { user_id: [ {role, content}, ... ] }
-conversation_memory: dict[int, list] = {}
-MAX_HISTORY = 10  # simpan 10 pesan terakhir per user
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-SYSTEM_PROMPT = """Kamu adalah asisten AI yang cerdas, ramah, dan helpful.
-Kamu bisa menjawab pertanyaan, menganalisis informasi, dan membantu berbagai tugas.
-Jika ada hasil pencarian internet, gunakan informasi itu untuk menjawab dengan akurat.
+# ── Memory percakapan per user ──────────────────
+memory: dict = {}
+MAX_HISTORY = 10
+
+SYSTEM_PROMPT = """Kamu adalah asisten AI yang cerdas dan ramah.
 Jawab dalam bahasa yang sama dengan user (Indonesia atau Inggris).
-Jika tidak tahu sesuatu, katakan jujur dan tawarkan untuk mencarinya."""
+Jika ada hasil pencarian, gunakan untuk menjawab dengan akurat."""
 
 
-# ──────────────────────────────────────────────
-# TOOLS
-# ──────────────────────────────────────────────
+# ── Tools ───────────────────────────────────────
 
 def search_internet(query: str) -> str:
-    """Cari informasi di internet menggunakan Tavily API (gratis 1000 req/bulan)."""
     if not TAVILY_API_KEY:
-        return "⚠️ Search tidak tersedia (TAVILY_API_KEY belum diset)."
+        return "Search tidak tersedia (TAVILY_API_KEY belum diset)."
     try:
-        response = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": query,
-                "search_depth": "basic",
-                "max_results": 3,
-            },
-            timeout=10,
-        )
-        data = response.json()
-        results = data.get("results", [])
+        r = requests.post("https://api.tavily.com/search", json={
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "search_depth": "basic",
+            "max_results": 3,
+        }, timeout=10)
+        results = r.json().get("results", [])
         if not results:
-            return "Tidak ada hasil pencarian ditemukan."
-
-        formatted = []
-        for r in results:
-            formatted.append(f"📌 {r.get('title', '')}\n{r.get('content', '')[:300]}...\nSumber: {r.get('url', '')}")
-        return "\n\n".join(formatted)
+            return "Tidak ada hasil."
+        out = []
+        for res in results:
+            out.append(f"- {res['title']}: {res['content'][:300]}")
+        return "\n".join(out)
     except Exception as e:
-        return f"Error saat search: {str(e)}"
-
-
-def get_current_time() -> str:
-    """Ambil waktu dan tanggal sekarang."""
-    now = datetime.now()
-    return now.strftime("Sekarang: %A, %d %B %Y pukul %H:%M:%S WIB")
+        return f"Error search: {e}"
 
 
 def calculate(expression: str) -> str:
-    """Hitung ekspresi matematika sederhana."""
     try:
-        # aman: hanya izinkan karakter angka dan operator dasar
         allowed = set("0123456789+-*/()., ")
         if all(c in allowed for c in expression):
-            result = eval(expression)  # noqa: S307
-            return f"Hasil: {expression} = {result}"
+            return f"{expression} = {eval(expression)}"  # noqa: S307
         return "Ekspresi tidak valid."
     except Exception as e:
-        return f"Error kalkulasi: {str(e)}"
+        return f"Error: {e}"
 
 
-# Daftar tools yang tersedia untuk LLM
-TOOLS_DEFINITION = [
+TOOLS_DEF = [
     {
         "type": "function",
         "function": {
             "name": "search_internet",
-            "description": "Cari informasi terbaru di internet. Gunakan ini untuk berita terkini, fakta yang perlu diverifikasi, atau info yang mungkin belum kamu tahu.",
+            "description": "Cari informasi terbaru di internet.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Query pencarian dalam bahasa Indonesia atau Inggris",
-                    }
-                },
+                "properties": {"query": {"type": "string"}},
                 "required": ["query"],
             },
         },
@@ -116,215 +73,152 @@ TOOLS_DEFINITION = [
     {
         "type": "function",
         "function": {
-            "name": "get_current_time",
-            "description": "Ambil waktu dan tanggal saat ini.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "calculate",
-            "description": "Hitung ekspresi matematika. Contoh: '25 * 4 + 10'",
+            "description": "Hitung ekspresi matematika.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "Ekspresi matematika yang ingin dihitung",
-                    }
-                },
+                "properties": {"expression": {"type": "string"}},
                 "required": ["expression"],
             },
         },
     },
 ]
 
-TOOLS_MAP = {
-    "search_internet": search_internet,
-    "get_current_time": lambda: get_current_time(),
-    "calculate": calculate,
-}
+TOOLS_MAP = {"search_internet": search_internet, "calculate": calculate}
 
 
-# ──────────────────────────────────────────────
-# GROQ API (LLM gratis)
-# ──────────────────────────────────────────────
+# ── Groq LLM ────────────────────────────────────
 
-def call_groq(messages: list, use_tools: bool = True) -> dict:
-    """Kirim request ke Groq API."""
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 1024,
-    }
-    if use_tools:
-        payload["tools"] = TOOLS_DEFINITION
-        payload["tool_choice"] = "auto"
-
-    response = requests.post(
+def call_groq(messages: list) -> dict:
+    r = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
-        headers=headers,
-        json=payload,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={"model": GROQ_MODEL, "messages": messages, "tools": TOOLS_DEF,
+              "tool_choice": "auto", "max_tokens": 1024},
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()
+    r.raise_for_status()
+    return r.json()
 
 
-def run_agent(user_id: int, user_message: str) -> str:
-    """
-    Jalankan AI agent dengan loop tool-calling:
-    1. Kirim pesan ke LLM
-    2. Jika LLM minta pakai tool → jalankan tool → kirim hasilnya kembali
-    3. Ulangi sampai LLM beri jawaban final
-    """
-    # Ambil atau buat history user
-    if user_id not in conversation_memory:
-        conversation_memory[user_id] = []
+def run_agent(user_id: int, user_msg: str) -> str:
+    if user_id not in memory:
+        memory[user_id] = []
 
-    history = conversation_memory[user_id]
-
-    # Bangun messages lengkap
+    history = memory[user_id]
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
-        {"role": "user", "content": user_message}
+        {"role": "user", "content": user_msg}
     ]
 
-    # Loop agent (max 5 iterasi agar tidak infinite loop)
     for _ in range(5):
-        response = call_groq(messages)
-        choice = response["choices"][0]
-        message = choice["message"]
+        resp = call_groq(messages)
+        choice = resp["choices"][0]
+        msg = choice["message"]
+        messages.append(msg)
 
-        # Tambah response LLM ke messages
-        messages.append(message)
-
-        # Cek apakah LLM selesai atau minta pakai tool
         if choice["finish_reason"] == "tool_calls":
-            # Jalankan setiap tool yang diminta
-            tool_calls = message.get("tool_calls", [])
-            for tc in tool_calls:
+            for tc in msg.get("tool_calls", []):
                 fn_name = tc["function"]["name"]
                 fn_args = json.loads(tc["function"].get("arguments", "{}"))
-                logger.info(f"🔧 Menjalankan tool: {fn_name}({fn_args})")
-
-                fn_result = TOOLS_MAP[fn_name](**fn_args)
-
-                # Masukkan hasil tool ke messages
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": str(fn_result),
-                })
+                log.info(f"Tool: {fn_name}({fn_args})")
+                result = TOOLS_MAP[fn_name](**fn_args)
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
         else:
-            # LLM sudah selesai → ambil jawaban final
-            final_answer = message.get("content", "Maaf, tidak ada jawaban.")
-
-            # Simpan ke memory (user + assistant)
-            history.append({"role": "user", "content": user_message})
-            history.append({"role": "assistant", "content": final_answer})
-
-            # Batasi history agar tidak terlalu panjang
+            answer = msg.get("content", "Maaf, tidak ada jawaban.")
+            history.append({"role": "user", "content": user_msg})
+            history.append({"role": "assistant", "content": answer})
             if len(history) > MAX_HISTORY * 2:
-                conversation_memory[user_id] = history[-(MAX_HISTORY * 2):]
+                memory[user_id] = history[-(MAX_HISTORY * 2):]
+            return answer
 
-            return final_answer
-
-    return "Maaf, agen tidak bisa menyelesaikan permintaan ini."
-
-
-# ──────────────────────────────────────────────
-# TELEGRAM HANDLERS
-# ──────────────────────────────────────────────
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(
-        f"👋 Halo {user.first_name}!\n\n"
-        "Saya adalah AI Agent yang bisa:\n"
-        "🔍 Mencari informasi di internet\n"
-        "💬 Mengingat percakapan kita\n"
-        "🧮 Menghitung matematika\n"
-        "🕐 Memberitahu waktu sekarang\n\n"
-        "Cukup ketik pertanyaan atau permintaanmu!\n\n"
-        "Perintah tersedia:\n"
-        "/start - Tampilkan pesan ini\n"
-        "/clear - Hapus history percakapan\n"
-        "/help  - Bantuan"
-    )
+    return "Maaf, tidak bisa menyelesaikan permintaan."
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💡 *Cara Pakai:*\n\n"
-        "Ketik saja pertanyaanmu secara natural!\n\n"
-        "*Contoh:*\n"
-        "• Berita terbaru tentang teknologi AI?\n"
-        "• Hitung 1234 * 5678\n"
-        "• Jam berapa sekarang?\n"
-        "• Jelaskan apa itu machine learning\n"
-        "• Lanjutkan percakapan sebelumnya...\n\n"
-        "Agent akan otomatis memilih tool yang tepat! 🤖",
-        parse_mode="Markdown",
-    )
+# ── Telegram API helpers ─────────────────────────
+
+def send_message(chat_id: int, text: str):
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={
+        "chat_id": chat_id, "text": text
+    }, timeout=10)
 
 
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conversation_memory[user_id] = []
-    await update.message.reply_text("🗑️ History percakapan kamu sudah dihapus!")
+def send_typing(chat_id: int):
+    requests.post(f"{TELEGRAM_API}/sendChatAction", json={
+        "chat_id": chat_id, "action": "typing"
+    }, timeout=5)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.effective_user.id
-    user_msg = update.message.text
+def get_updates(offset: int = 0) -> list:
+    r = requests.get(f"{TELEGRAM_API}/getUpdates", params={
+        "offset": offset, "timeout": 30
+    }, timeout=35)
+    return r.json().get("result", [])
 
-    # Kirim "typing..." indicator
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action="typing"
-    )
 
+# ── Handler pesan ────────────────────────────────
+
+def handle_update(update: dict):
+    msg = update.get("message", {})
+    if not msg:
+        return
+
+    chat_id = msg["chat"]["id"]
+    user_id = msg["from"]["id"]
+    text    = msg.get("text", "")
+
+    if not text:
+        return
+
+    if text == "/start":
+        send_message(chat_id,
+            "👋 Halo! Saya AI Agent yang bisa:\n"
+            "🔍 Cari info di internet\n"
+            "🧮 Hitung matematika\n"
+            "💬 Ingat percakapan kita\n\n"
+            "Ketik saja pertanyaanmu!\n"
+            "/clear - hapus history"
+        )
+        return
+
+    if text == "/clear":
+        memory[user_id] = []
+        send_message(chat_id, "🗑️ History dihapus!")
+        return
+
+    if text == "/help":
+        send_message(chat_id,
+            "💡 Contoh:\n"
+            "• Berita AI terbaru?\n"
+            "• Hitung 1234 * 5678\n"
+            "• Jelaskan machine learning\n"
+        )
+        return
+
+    send_typing(chat_id)
     try:
-        reply = run_agent(user_id, user_msg)
+        reply = run_agent(user_id, text)
     except Exception as e:
-        logger.error(f"Error: {e}")
-        reply = f"❌ Terjadi error: {str(e)}\nCoba lagi atau ketik /clear untuk reset."
+        log.error(f"Error: {e}")
+        reply = f"❌ Error: {e}"
 
-    await update.message.reply_text(reply)
+    send_message(chat_id, reply)
 
 
-# ──────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────
+# ── Main loop ────────────────────────────────────
 
 def main():
-    import os
-    print("=== DEBUG ENV VARIABLES ===")
-    print(f"TELEGRAM_TOKEN ada: {bool(os.environ.get('TELEGRAM_TOKEN'))}")
-    print(f"GROQ_API_KEY ada: {bool(os.environ.get('GROQ_API_KEY'))}")
-    print(f"TAVILY_API_KEY ada: {bool(os.environ.get('TAVILY_API_KEY'))}")
-    print(f"Semua env keys: {[k for k in os.environ.keys() if not k.startswith('RAILWAY')]}")
-    print("===========================")
-
-    if not TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_TOKEN belum diset di .env!")
-    if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY belum diset di .env!")
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help",  help_command))
-    app.add_handler(CommandHandler("clear", clear_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("🤖 Bot berjalan...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("✅ ENV OK — Token ada, Groq key ada")
+    log.info("🤖 Bot berjalan dengan long polling...")
+    offset = 0
+    while True:
+        try:
+            updates = get_updates(offset)
+            for update in updates:
+                handle_update(update)
+                offset = update["update_id"] + 1
+        except Exception as e:
+            log.error(f"Error polling: {e}")
+            time.sleep(3)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import time
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY", "")
-MODEL              = "qwen/qwen3-next-80b-a3b-instruct:free"
+MODEL              = "stepfun/step-3.5-flash:free"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 log = logging.getLogger(__name__)

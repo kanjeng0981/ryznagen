@@ -303,6 +303,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────
 
 def main():
+    import os
+    print("=== DEBUG ENV VARIABLES ===")
+    print(f"TELEGRAM_TOKEN ada: {bool(os.environ.get('TELEGRAM_TOKEN'))}")
+    print(f"GROQ_API_KEY ada: {bool(os.environ.get('GROQ_API_KEY'))}")
+    print(f"TAVILY_API_KEY ada: {bool(os.environ.get('TAVILY_API_KEY'))}")
+    print(f"Semua env keys: {[k for k in os.environ.keys() if not k.startswith('RAILWAY')]}")
+    print("===========================")
+
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN belum diset di .env!")
     if not GROQ_API_KEY:
